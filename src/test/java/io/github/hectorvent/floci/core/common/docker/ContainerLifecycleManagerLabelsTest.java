@@ -10,6 +10,7 @@ import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.WaitContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Capability;
+import com.github.dockerjava.api.model.HealthCheck;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -78,6 +79,18 @@ class ContainerLifecycleManagerLabelsTest {
         lenient().when(dockerConfig.resourceNamespace()).thenReturn(Optional.empty());
         lenient().when(imageCacheService.ensureImageExists(any()))
                 .thenAnswer(invocation -> invocation.getArgument(0));
+    }
+
+    @Test
+    void createForwardsAnExplicitHealthCheckToDocker() {
+        CreateContainerCmd command = stubCreateContainer();
+        HealthCheck health = new HealthCheck().withTest(List.of("CMD", "true"));
+        ContainerSpec spec = new ContainerBuilder(null, null, null)
+                .newContainer("busybox:stable").withHealthCheck(health).build();
+
+        manager().create(spec);
+
+        verify(command).withHealthcheck(health);
     }
 
     @Test

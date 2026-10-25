@@ -153,6 +153,10 @@ class EcsCfnProvisionerTest {
         container.putArray("Environment").addObject().put("Name", "MODE").put("Value", "prod");
         container.putArray("Secrets").addObject().put("Name", "DB").put("ValueFrom", "arn:aws:secretsmanager:x");
         container.putArray("Command").add("run").add("--fast");
+        container.putArray("DependsOn").addObject().put("ContainerName", "cache").put("Condition", "HEALTHY");
+        ObjectNode health = container.putObject("HealthCheck").put("Interval", 10).put("Timeout", 5)
+                .put("Retries", 3).put("StartPeriod", 30);
+        health.putArray("Command").add("CMD").add("valkey-cli").add("ping");
         ObjectNode log = container.putObject("LogConfiguration");
         log.put("LogDriver", "awsfirelens");
         log.putObject("Options").put("Name", "s3").put("bucket", "logs");
@@ -178,6 +182,13 @@ class EcsCfnProvisionerTest {
         assertEquals("prod", def.getEnvironment().get(0).value());
         assertEquals("arn:aws:secretsmanager:x", def.getSecrets().get(0).valueFrom());
         assertEquals(List.of("run", "--fast"), def.getCommand());
+        assertEquals("cache", def.getDependsOn().getFirst().containerName());
+        assertEquals("HEALTHY", def.getDependsOn().getFirst().condition());
+        assertEquals(List.of("CMD", "valkey-cli", "ping"), def.getHealthCheck().command());
+        assertEquals(10, def.getHealthCheck().interval());
+        assertEquals(5, def.getHealthCheck().timeout());
+        assertEquals(3, def.getHealthCheck().retries());
+        assertEquals(30, def.getHealthCheck().startPeriod());
         assertEquals("awsfirelens", def.getLogConfiguration().logDriver());
         assertEquals("s3", def.getLogConfiguration().options().get("Name"));
         assertEquals("logs", def.getLogConfiguration().options().get("bucket"));

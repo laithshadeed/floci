@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common.docker;
 
 import com.github.dockerjava.api.model.DeviceRequest;
+import com.github.dockerjava.api.model.HealthCheck;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import org.junit.jupiter.api.Test;
@@ -16,6 +17,15 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class ContainerBuilderTest {
+
+    @Test
+    void explicitHealthCheckReachesTheContainerSpec() {
+        TestFixture fixture = new TestFixture();
+        HealthCheck health = new HealthCheck().withTest(List.of("CMD", "true"));
+        ContainerSpec spec = fixture.builder.newContainer("alpine").withHealthCheck(health).build();
+        assertEquals(health, spec.healthCheck());
+        assertNull(new ContainerSpec("alpine").healthCheck());
+    }
 
     @Test
     void withDockerNetwork_usesExplicitServiceNetworkFirst() {

@@ -7,10 +7,12 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.ecs.EcsService;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDependency;
 import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
 import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
 import io.github.hectorvent.floci.services.ecs.model.EcsServiceModel;
 import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.HealthCheck;
 import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.LaunchType;
 import io.github.hectorvent.floci.services.ecs.model.LogConfiguration;
@@ -344,6 +346,22 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
             }
             if (item.hasNonNull("MemoryReservation")) {
                 def.setMemoryReservation(item.path("MemoryReservation").asInt());
+            }
+            if (item.path("DependsOn").isArray()) {
+                List<ContainerDependency> dependencies = new ArrayList<>();
+                for (JsonNode dependency : item.path("DependsOn")) {
+                    dependencies.add(new ContainerDependency(dependency.path("ContainerName").asText(),
+                            dependency.path("Condition").asText()));
+                }
+                def.setDependsOn(dependencies);
+            }
+            JsonNode health = item.path("HealthCheck");
+            if (health.isObject()) {
+                def.setHealthCheck(new HealthCheck(toStringList(health.path("Command")),
+                        health.hasNonNull("Interval") ? health.path("Interval").asInt() : null,
+                        health.hasNonNull("Timeout") ? health.path("Timeout").asInt() : null,
+                        health.hasNonNull("Retries") ? health.path("Retries").asInt() : null,
+                        health.hasNonNull("StartPeriod") ? health.path("StartPeriod").asInt() : null));
             }
             def.setPortMappings(parsePortMappings(item.path("PortMappings")));
             def.setEnvironment(parseEnvironment(item.path("Environment")));

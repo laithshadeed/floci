@@ -41,6 +41,7 @@ import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
 import io.github.hectorvent.floci.services.ecs.model.EfsVolumeConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.HealthCheck;
 import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
 import io.github.hectorvent.floci.services.ecs.model.LogConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.ManagedAgent;
@@ -259,6 +260,19 @@ public class EcsContainerManager {
         List<ContainerDefinition> launchOrder = orderForDependencies(
                 launchOrder(taskDef.getContainerDefinitions(), firelensRouter), firelensRouter);
 
+        if (taskDef.getNetworkMode() == NetworkMode.awsvpc
+                && (firewallManager == null || !firewallManager.enabled())) {
+            for (ContainerDefinition definition : launchOrder) {
+                if (definition.getDependsOn() != null && definition.getDependsOn().stream()
+                        .anyMatch(dependency -> ContainerDependency.COMPLETE.equals(dependency.condition())
+                                || ContainerDependency.SUCCESS.equals(dependency.condition()))) {
+                    throw new AwsException("ClientException",
+                            "Unprotected awsvpc tasks do not support COMPLETE/SUCCESS init dependencies; "
+                                    + "the first workload must remain running to own the shared task namespace.", 400);
+                }
+            }
+        }
+
         // Task-level volumes consumed by per-container mountPoints: host volumes map their
         // name -> absolute host source path; efsVolumeConfiguration volumes map their
         // name -> EFS configuration (materialised below as a shared local Docker volume).
@@ -349,6 +363,10 @@ public class EcsContainerManager {
                 ? taskDef.getNetworkMode().name()
                 : NetworkMode.bridge.name();
 
+        // awsvpc shares one namespace even when firewall enforcement is disabled (including rootless engines).
+        // The first workload owns it and publishes every task port before dependent workloads join it.
+        boolean sharedWorkloadNetwork = protectedNetwork == null && taskDef.getNetworkMode() == NetworkMode.awsvpc;
+        String workloadNetworkOwner = null;
         try {
             for (ContainerDefinition def : launchOrder) {
                 awaitDependencies(def, containerIds);
@@ -387,11 +405,11 @@ public class EcsContainerManager {
                 if (protectedNetwork != null) {
                     specBuilder.withNetworkMode("container:" + protectedNetwork.namespace().helperId());
                     specBuilder.withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL, "true"));
+                } else if (sharedWorkloadNetwork && workloadNetworkOwner != null) {
+                    specBuilder.withNetworkMode("container:" + workloadNetworkOwner);
                 }
-                // Its own address in the credential endpoint's range, so this container has a
-                // connected route to 169.254.170.2 at all. One per container, not per task: each
-                // has its own network namespace and so its own routing table.
-                if (taskRoleEndpoint.vending()) {
+                // One credential-endpoint route per network namespace; awsvpc workloads share the owner's route.
+                if (taskRoleEndpoint.vending() && (!sharedWorkloadNetwork || workloadNetworkOwner == null)) {
                     specBuilder.withLinkLocalIp(
                             linkLocalAddresses.allocate(taskRoleEndpoint.network(), task.getTaskArn()));
                 }
@@ -445,7 +463,24 @@ public class EcsContainerManager {
                 // host port in native mode, or expose-only in Docker mode where ECS
                 // consumers reach containers via the docker network IP. The explicit
                 // emulator opt-in below publishes a stable port for host-side clients.
-                if (protectedNetwork == null && def.getPortMappings() != null) {
+                if (sharedWorkloadNetwork && workloadNetworkOwner == null) {
+                    Map<Integer, Integer> bindings = namespacePortBindings(taskDef,
+                            containerDetector.isRunningInContainer(), config.services().ecs().publishAwsvpcPortsToHost());
+                    bindings.forEach((port, hostPort) -> {
+                        if (hostPort == 0) {
+                            specBuilder.withDynamicPort(port);
+                        } else {
+                            specBuilder.withPortBinding(port, hostPort);
+                        }
+                    });
+                    for (ContainerDefinition member : taskDef.getContainerDefinitions()) {
+                        if (member.getPortMappings() != null) {
+                            member.getPortMappings().stream()
+                                    .filter(port -> !bindings.containsKey(port.containerPort()))
+                                    .forEach(port -> specBuilder.withExposedPort(port.containerPort()));
+                        }
+                    }
+                } else if (!sharedWorkloadNetwork && protectedNetwork == null && def.getPortMappings() != null) {
                     boolean awsvpc = taskDef.getNetworkMode() == NetworkMode.awsvpc;
                     boolean publishAwsvpcPorts = awsvpc
                             && config.services().ecs().publishAwsvpcPortsToHost();
@@ -531,6 +566,16 @@ public class EcsContainerManager {
                     }
                 }
 
+                if (def.getHealthCheck() != null) {
+                    HealthCheck health = def.getHealthCheck();
+                    // Docker and ECS each define HealthCheck; qualify the Docker adapter.
+                    specBuilder.withHealthCheck(new com.github.dockerjava.api.model.HealthCheck()
+                            .withTest(health.command())
+                            .withInterval(TimeUnit.SECONDS.toNanos(health.interval() != null ? health.interval() : 30))
+                            .withTimeout(TimeUnit.SECONDS.toNanos(health.timeout() != null ? health.timeout() : 5))
+                            .withRetries(health.retries() != null ? health.retries() : 3)
+                            .withStartPeriod(TimeUnit.SECONDS.toNanos(health.startPeriod() != null ? health.startPeriod() : 0)));
+                }
                 ContainerSpec spec = specBuilder.build();
 
                 String dockerId;
@@ -550,13 +595,17 @@ public class EcsContainerManager {
                     dockerId = info.containerId();
                 }
 
+                if (sharedWorkloadNetwork && workloadNetworkOwner == null) {
+                    workloadNetworkOwner = dockerId;
+                }
                 containerIds.put(def.getName(), dockerId);
 
                 LOG.infov("Created ECS container {0} for task {1} container {2}", dockerId, taskId, def.getName());
 
                 // Resolve network bindings for ECS-specific model
                 List<NetworkBinding> networkBindings = resolveNetworkBindings(
-                        protectedNetwork == null ? dockerId : protectedNetwork.namespace().helperId(), def);
+                        protectedNetwork != null ? protectedNetwork.namespace().helperId()
+                                : sharedWorkloadNetwork ? workloadNetworkOwner : dockerId, def);
 
                 // Build ECS container model
                 Container container = buildContainer(task.getTaskArn(), def, dockerId, networkBindings, region,

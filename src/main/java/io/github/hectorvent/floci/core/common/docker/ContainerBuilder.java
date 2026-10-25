@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common.docker;
 import com.github.dockerjava.api.model.AccessMode;
 import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.DeviceRequest;
+import com.github.dockerjava.api.model.HealthCheck;
 import com.github.dockerjava.api.model.LogConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
@@ -152,6 +153,7 @@ public class ContainerBuilder {
         private Integer cpuShares;
         private boolean readonlyRootfs;
         private boolean init;
+        private HealthCheck healthCheck;
         private final Map<Integer, Integer> portBindings = new HashMap<>();
         private final List<Integer> loopbackPortBindings = new ArrayList<>();
         private final Map<Integer, String> portBindingHostIps = new HashMap<>();
@@ -673,6 +675,11 @@ public class ContainerBuilder {
         /**
          * Builds the immutable ContainerSpec.
          */
+        public Builder withHealthCheck(HealthCheck healthCheck) {
+            this.healthCheck = healthCheck;
+            return this;
+        }
+
         public ContainerSpec build() {
             return new ContainerSpec(
                     image,
@@ -703,7 +710,8 @@ public class ContainerBuilder {
                     readonlyRootfs,
                     List.copyOf(linkLocalIps),
                     Map.copyOf(portBindingHostIps),
-                    init
+                    init,
+                    healthCheck
             );
         }
     }

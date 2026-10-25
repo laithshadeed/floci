@@ -587,3 +587,7 @@ If behavior is unclear:
 3. Then compatibility test expectations
 
 If a task would require broad architectural changes, stop and surface the tradeoffs instead of refactoring across services blindly.
+
+## Constraints
+
+- Use isolated git worktrees for deployment and benchmark changes; do not edit the original checkout.

@@ -5,6 +5,7 @@ import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.InspectVolumeCmd;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -20,7 +21,9 @@ import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDependency;
 import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.HealthCheck;
 import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
 import io.github.hectorvent.floci.services.ecs.model.NetworkMode;
 import io.github.hectorvent.floci.services.ecs.model.PortMapping;
@@ -31,11 +34,14 @@ import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -150,6 +156,87 @@ class EcsContainerManagerSecurityGroupTest {
         verify(builder, never()).withLabels(Map.of("io.floci.security-group.workload", "true"));
         verify(ec2Service, never()).createNetworkInterface(any(), any(), any(), any(), any(), any(), any());
         verify(builder).withDynamicPort(80);
+    }
+
+    @Test
+    void unprotectedAwsvpcSidecarsShareFirstWorkloadNamespaceAndPublishAllTaskPortsOnce() {
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        TaskDefinition taskDef = awsvpcTaskDef(List.of(new PortMapping(6379, 6379, "tcp")));
+        ContainerDefinition sidecar = new ContainerDefinition();
+        sidecar.setName("application");
+        sidecar.setImage("app:latest");
+        sidecar.setPortMappings(List.of(new PortMapping(8080, 8080, "tcp")));
+        taskDef.setContainerDefinitions(List.of(taskDef.getContainerDefinitions().getFirst(), sidecar));
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerInfo("owner-id", Map.of()), new ContainerInfo("application-id", Map.of()));
+
+        manager.startTask(awsvpcTask(), taskDef, List.of(), "us-east-1");
+
+        verify(builder).withNetworkMode("container:owner-id");
+        verify(builder).withDynamicPort(6379);
+        verify(builder).withDynamicPort(8080);
+        verify(builder, never()).withPortBinding(anyInt(), anyInt());
+        verify(firewallManager, never()).createNamespace(any(), any(), any(), any(), any(), any(), any());
+        // Both ECS containers discover their published bindings through the namespace owner.
+        verify(dockerClient, times(3)).inspectContainerCmd("owner-id");
+        verify(dockerClient).inspectContainerCmd("application-id");
+    }
+
+    @Test
+    void unprotectedAwsvpcInitDependenciesFailBeforeAnyContainerStarts() {
+        for (String condition : List.of("COMPLETE", "SUCCESS")) {
+            TaskDefinition taskDef = awsvpcTaskDef(List.of());
+            taskDef.getContainerDefinitions().getFirst().setDependsOn(List.of(
+                    new ContainerDependency("init", condition)));
+            ContainerDefinition init = new ContainerDefinition();
+            init.setName("init");
+            init.setImage("init:latest");
+            taskDef.setContainerDefinitions(List.of(taskDef.getContainerDefinitions().getFirst(), init));
+
+            AwsException error = assertThrows(
+                    AwsException.class,
+                    () -> manager.startTask(awsvpcTask(), taskDef, List.of(), "us-east-1"));
+            assertTrue(error.getMessage().contains("COMPLETE/SUCCESS"));
+        }
+        verify(lifecycleManager, never()).createAndStart(any());
+        verify(lifecycleManager, never()).create(any());
+    }
+
+    @Test
+    void ecsHealthCheckIsForwardedWithDockerNanosecondDurations() {
+        TaskDefinition taskDef = awsvpcTaskDef(List.of());
+        taskDef.getContainerDefinitions().getFirst().setHealthCheck(
+                new HealthCheck(
+                        List.of("CMD", "valkey-cli", "ping"), 10, 5, 3, 30));
+
+        manager.startTask(awsvpcTask(), taskDef, List.of(), "us-east-1");
+
+        // Docker and ECS each define HealthCheck; qualify the Docker adapter.
+        ArgumentCaptor<com.github.dockerjava.api.model.HealthCheck> health =
+                ArgumentCaptor.forClass(com.github.dockerjava.api.model.HealthCheck.class);
+        verify(builder).withHealthCheck(health.capture());
+        assertEquals(List.of("CMD", "valkey-cli", "ping"), health.getValue().getTest());
+        assertEquals(10_000_000_000L, health.getValue().getInterval());
+        assertEquals(5_000_000_000L, health.getValue().getTimeout());
+        assertEquals(30_000_000_000L, health.getValue().getStartPeriod());
+        assertEquals(3, health.getValue().getRetries());
+    }
+
+    @Test
+    void bridgeSidecarsKeepIndependentNetworksAndPorts() {
+        TaskDefinition taskDef = awsvpcTaskDef(List.of(new PortMapping(8080, 18080, "tcp")));
+        taskDef.setNetworkMode(NetworkMode.bridge);
+        ContainerDefinition sidecar = new ContainerDefinition();
+        sidecar.setName("cache");
+        sidecar.setImage("cache:latest");
+        sidecar.setPortMappings(List.of(new PortMapping(6379, 16379, "tcp")));
+        taskDef.setContainerDefinitions(List.of(taskDef.getContainerDefinitions().getFirst(), sidecar));
+
+        manager.startTask(awsvpcTask(), taskDef, List.of(), "us-east-1");
+
+        verify(builder, never()).withNetworkMode(anyString());
+        verify(builder).withPortBinding(8080, 18080);
+        verify(builder).withPortBinding(6379, 16379);
     }
 
     @Test

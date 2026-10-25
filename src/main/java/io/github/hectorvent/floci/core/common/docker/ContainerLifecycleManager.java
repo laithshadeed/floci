@@ -208,6 +208,9 @@ public class ContainerLifecycleManager {
             createCmd.withPlatform(platform);
         }
 
+        if (spec.healthCheck() != null) {
+            createCmd.withHealthcheck(spec.healthCheck());
+        }
         if (spec.name() != null) {
             createCmd.withName(spec.name());
         }
